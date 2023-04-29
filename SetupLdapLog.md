@@ -6,9 +6,8 @@
         and set rogerdeng.net to root dn 
 
         ```
-        sudo apt install slapd
+        sudo apt -y install slapd ldap-utils libnss-ldap libpam-ldap libpam-ldapd gnutls-bin ssl-cert 
         sudo dpkg-reconfigure slapd
-        sudo apt install ldap-utils
         ```
     
     1. check if ldap is working
@@ -63,7 +62,7 @@
         ```ldif
         #sudoer.ldif
         dn: cn=Sudoer,ou=Groups,dc=rogerdeng,dc=net
-        objectClass: posixGroup
+        objectClass: groupOfNames
         cn: Sudoer
         member : cn=roger,ou=People,dc=rogerdeng,dc=net
         ```
@@ -73,22 +72,22 @@
 
     5. Create user roger under People
         ```ldif
-        #roger.ldif
-        dn: cn=roger,ou=People,dc=rogerdeng,dc=net
+        dn: cn=rogerdeng,ou=People,dc=rogerdeng,dc=net
         objectClass: inetOrgPerson
         objectClass: posixAccount
         objectClass: shadowAccount
+        objectClass: organizationalPerson
         objectClass: top
         objectClass: person
-        cn: Roger
+        cn: rogerdeng
         sn: Deng
-        uidNumber: 1000
-        gidNumber: 1000
-        homeDirectory: /home/roger
+        uidNumber: 1002
+        gidNumber: 1002
+        homeDirectory: /home/rogerdeng
         loginShell: /bin/bash
-        uid: roger
+        uid: rogerdeng
+        userPassword: <yourPassword>
         mail: rogerdeng92@gmail.com
-        memberOf: cn=RogerGroup,ou=Groups,dc=rogerdeng,dc=net
         ```
         
         - !issue
@@ -185,49 +184,90 @@ olcModuleLoad: {0}memberof.la`
         After completing these steps, you should be able to use LDAP for authentication and account information on your Linux system.
         
 - LDAP over TLS 
-    - instal openssl `sudo apt-get install openssl` 
-    - makesure `/etc/hostname` is correct
-    - in my case :
-        - `hostname -f` :  `ldapServer.rogerdeng.net`
-        - `hostname` :     `ldapServer`
-    - `cd ~/ssl-ldap`
-    - `openssl genrsa -aes128 -out ldapServer.rogerdeng.net.key 4096`
-    - `openssl rsa -in ldapServer.rogerdeng.net.key -out ldapServer.rogerdeng.net.key`
-        - make sure FDQN are same as `hostname -f`
-    - `openssl req -new -days 3650 -key ldapServer.rogerdeng.net.key -out ldapServer.rogerdeng.net.csr `
-    - `sudo cp ~/ssl-ldap/*.key /etc/ldap/sasl2/`
-    - `sudo cp ~/ssl-ldap/*.crt /etc/ldap/sasl2/`
-    - `sudo cp /etc/ssl/certs/ca-certificates.crt /etc/ldap/sasl2/`
-    - `sudo groupadd ssl-cert`
-    - `sudo usermod -aG ssl-cert openldap`
-    - `sudo chown :ssl-cert /etc/ldap/sasl2`
-    - make file sslLdap.ldif : 
+
+    - create CA private key 
+        ```
+        sudo certtool --generate-privkey --bits 4096 --outfile /etc/ssl/private/mycakey.pem
+        ```
+    
+    - create template of CA 
+        - vim /etc/ssl/ca.info 
+        ```
+        cn = rogerdeng
+        ca
+        cert_signing_key
+        expiration_days = 3650
+        ```
+        
+    - signed the CA 
+        ```
+        sudo certtool --generate-self-signed \
+        --load-privkey /etc/ssl/private/mycakey.pem \
+        --template /etc/ssl/ca.info \
+        --outfile /usr/local/share/ca-certificates/mycacert.crt
+        ```
+        
+    - let new CA be trusted 
+        ```
+        sudo update-ca-certificates
+        ```
+        
+    - point 
+        ```
+        sudo certtool --generate-privkey \
+        --bits 2048 \
+        --outfile /etc/ldap/ldap01_slapd_key.pem
+        ```
+        
+    - edit ldap01 info  `vim /etc/ssl/ldap01.info`
+        ```
+        organization = rogerdeng
+        cn = ldap.rogerdeng.net
+        tls_www_server
+        encryption_key
+        signing_key
+        expiration_days = 365
+        ```
+        
+    - let openldap read the CA 
+        ```
+        sudo chgrp openldap /etc/ldap/ldap01_slapd_key.pem
+        sudo chmod 0640 /etc/ldap/ldap01_slapd_key.pem
+        ```
+        
+    - tell slapd about our TLS work via the slapd-config
+        - ldapTls.ldif
         ```
         dn: cn=config
-        changetype: modify
         add: olcTLSCACertificateFile
-        olcTLSCACertificateFile: /etc/ldap/sasl2/ca-certificates.crt
+        olcTLSCACertificateFile: /etc/ssl/certs/mycacert.pem
         -
-        replace: olcTLSCertificateFile
-        olcTLSCertificateFile: /etc/ldap/sasl2/ldapServer.rogerdeng.net.crt
+        add: olcTLSCertificateFile
+        olcTLSCertificateFile: /etc/ldap/ldap01_slapd_cert.pem
         -
-        replace: olcTLSCertificateKeyFile
-        olcTLSCertificateKeyFile: /etc/ldap/sasl2/ldapServer.rogerdeng.net.key
+        add: olcTLSCertificateKeyFile
+        olcTLSCertificateKeyFile: /etc/ldap/ldap01_slapd_key.pem
         ```
-    - `sudo ldapmodify -Y EXTERNAL -H ldapi:/// -f sslLdap.ldif`
-    - `sudo vim /etc/default/slapd` add `ldaps:///` in to SLAPD_SERVICES
-    - `sudo vim /etc/ldap/ldap.conf` exchange 
-        ```
-        TLS_CACERT	/etc/ldap/sasl2/ca-certificates.crt
-        TLS_REQCERT	allow
-        ```
-    - `sudo systemctl restart slapd`
-    - `sudo systemctl restart slapd.service`
-    - `ldapsearch -x -H ldaps://127.0.0.1 =b "dc=rogerdeng,dc=net"` to make sure tls(ldaps) working 
+        `sudo ldapmodify -Y EXTERNAL -H ldapi:/// -f ldapTls.ldif`
+        
+    - add `ldaps:///` into `/etc/default/slapd`
+        - `vim /etc/default/slapd`
+            - `SLAPD_SERVICES="ldap:/// ldapi:/// ldaps:///"`
+            
+    - restart sladp
+        - `sudo systemctl restart slapd`
+    
+    - Test tls 
+        `ldapwhoami -x -ZZ -H ldap://ldap.rogerdeng.net`
+    
+    - Test ldaps
+        `ldapwhoami -x -H ldaps://ldap.rogerdeng.net`
 
 - Forces TLS over LDAP 
+
     - make sure your database type : 
         `sudo ldapsearch -H ldapi:// -Y EXTERNAL -b "cn=config" -LLL -Q "(olcSuffix=*)" dn olcSuffix`
+        
     - vim ~/forcetls.ldif
         ```
         dn: olcDatabase={1}<change to your database type>,cn=config
@@ -237,5 +277,13 @@ olcModuleLoad: {0}memberof.la`
         ```
     - `sudo ldapmodify -H ldapi:// -Y EXTERNAL -f forcetls.ldif`
     - `sudo service slapd force-reload`
+    - `sudo systemctl restat`
     - `ldapsearch -H ldap:// -x -b "dc=rogerdeng,dc=net" -LLL -Z dn`
     
+- reference document:
+    - https://blueskyson.github.io/2021/06/15/LDAP-setting/
+    - https://linux.vbird.org/somepaper/20050817-ldap-3.pdf
+    - https://ubuntu.com/server/docs/service-ldap-with-tls
+    - https://www.openldap.org/doc/admin24/tls.html
+    - https://www.digitalocean.com/community/tutorials/how-to-encrypt-openldap-connections-using-starttls#setting-up-the-client-machines
+    - https://idmoim.blogspot.com/2014/05/ldapadd-insufficient-access-50-openldap.html
